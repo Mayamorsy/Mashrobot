@@ -1,8 +1,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-const char* ssid = "aymanzain";
-const char* password = "9655723679";
+const char* ssid = "";
+const char* password = "";
 const char* serverUrl = "http://192.168.1.9:5000/upload"; // Replace X with your PC's IP
 
 const int micPin = 4;
