@@ -1,0 +1,162 @@
+/*
+ * IR start + Ultrasonic stop + Stepper (DRV8825 + AccelStepper) + Water pump relay
+ */
+
+#include <AccelStepper.h>
+
+// ---------- STEPPER PINS ----------
+#define DIR_PIN 3
+#define STEP_PIN 4
+// Other DRV8825 pins like ENABLE/MS1/MS2/MS3 stay as you wired them
+
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+
+// ---------- IR SENSOR ----------
+const int IRSensor = 9;   // HW-201 OUT pin
+const int LED      = 13;  // On-board LED
+
+// ---------- ULTRASONIC ----------
+const int trigPin  = 10;  // Ultrasonic TRIG
+const int echoPin  = 11;  // Ultrasonic ECHO
+
+// ---------- RELAY / WATER PUMP ----------
+const int relayPin = 8;   // Relay control pin
+
+// ---------- SETTINGS ----------
+const int stopDistanceCm     = 8;   // Distance where we STOP the stepper
+const int thresholdDistance  = 10;  // Distance range where pump should run
+
+// ---------- STATE ----------
+bool motorStarted     = false;   // IR has triggered at least once
+bool motorRunning     = false;   // Stepper currently moving
+bool positionReached  = false;   // Stepper reached ultrasonic stop position
+
+bool handDetected     = false;   // Cup in front of ultrasonic in pump phase
+bool pumpOn           = false;   // Relay state
+
+void setup() {
+  Serial.begin(9600);
+
+  // ----- Stepper setup -----
+  stepper.setMaxSpeed(300);      // tune as needed
+  stepper.setAcceleration(100);  // tune as needed
+  stepper.setSpeed(200);         // not used by run(), but fine
+  stepper.moveTo(200);           // initial target
+
+  // ----- IR -----
+  pinMode(IRSensor, INPUT);
+  pinMode(LED, OUTPUT);
+
+  // ----- Ultrasonic -----
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  // ----- Relay -----
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);   // Pump OFF at start (assuming HIGH = ON)
+
+  Serial.println("System ready: IR start + Ultrasonic stop + Stepper + Pump");
+}
+
+void loop() {
+  // -------- 1. IR: start stepper ONCE --------
+  int sensorStatus = digitalRead(IRSensor);
+
+  // HW-201: LOW = object detected
+  if (sensorStatus == LOW && !motorStarted) {
+    motorStarted = true;
+    motorRunning = true;
+    digitalWrite(LED, HIGH);
+    Serial.println("IR: Cup detected first time -> starting stepper");
+  }
+
+  // After this, IR does NOTHING. Only used once to start the stepper.
+
+  // -------- 2. Ultrasonic distance --------
+  long distance = getDistance();
+
+  if (distance > 0) {
+    Serial.print("Ultrasonic distance: ");
+    Serial.print(distance);
+    Serial.println(" cm");
+  } else {
+    Serial.println("Ultrasonic: no echo (too far or no object)");
+  }
+
+  // -------- 3. Stepper stop logic (position reached) --------
+  if (motorRunning && distance > 0 && distance <= stopDistanceCm) {
+    motorRunning = false;
+    positionReached = true;
+    Serial.println("Ultrasonic: cup reached stop distance -> stopping stepper");
+  }
+
+  // -------- 4. Pump control (only AFTER stepper stopped in position) --------
+  if (positionReached) {
+    // now we use the ultrasonic to decide pump ON/OFF
+
+    if (distance > 0 && distance <= thresholdDistance) {
+      if (!handDetected) {
+        handDetected = true;
+        Serial.println("Pump phase: cup detected in pump zone");
+      }
+    } else {
+      if (handDetected) {
+        handDetected = false;
+        Serial.println("Pump phase: cup left pump zone");
+      }
+    }
+
+    // Relay control like your original motor code
+    if (handDetected && !pumpOn) {
+      digitalWrite(relayPin, HIGH);   // HIGH = pump ON (if your relay is active HIGH)
+      pumpOn = true;
+      Serial.println("Pump ON");
+    } 
+    else if (!handDetected && pumpOn) {
+      digitalWrite(relayPin, LOW);    // pump OFF
+      pumpOn = false;
+      Serial.println("Pump OFF");
+    }
+  } else {
+    // Safety: before position reached, pump must stay OFF
+    if (pumpOn) {
+      digitalWrite(relayPin, LOW);
+      pumpOn = false;
+      Serial.println("Pump OFF (position not reached yet)");
+    }
+  }
+
+  // -------- 5. Stepper motion --------
+  if (motorRunning) {
+    // back-and-forth motion
+    if (stepper.distanceToGo() == 0) {
+      stepper.moveTo(-stepper.currentPosition());
+    }
+    stepper.run();
+  }
+  // If motorRunning == false: stepper holds position
+
+  delay(50);  // small delay; motion still smooth + serial readable
+}
+
+// ---------- HELPER: ultrasonic distance ----------
+long getDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000); // 30ms timeout
+
+  if (duration == 0) {
+    return -1;  // no echo
+  }
+
+  long distance = duration * 0.034 / 2; // in cm
+  if (distance < 2 || distance > 400) {
+    return -1;  // out of range
+  }
+  return distance;
+}
