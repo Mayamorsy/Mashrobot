@@ -1,185 +1,328 @@
-#include <Arduino.h>
+
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include "Audio.h" // Install "ESP32-audioI2S" by Schreibfaul1
+#include "SPIFFS.h"
 
-// --- USER CONFIGURATION ---
-const char* WIFI_SSID = "WE_1C368E";
-const char* WIFI_PASSWORD = "lbp08202";
-// Update this with your Laptop's IP Address!
-const char* SERVER_BASE_URL = "http://192.168.1.25:5000"; 
+// ---------------- USER CONFIG ----------------
+const char* WIFI_SSID     = "Mayousha";
+const char* WIFI_PASSWORD = "mayoosh123";
+const char* SERVER_UPLOAD = "http://172.20.10.6:5000/upload";
+const char* SERVER_RESET  = "http://172.20.10.6:5000/reset";
 
-// --- PIN CONFIGURATION ---
-const int MIC_PIN = 1;      // Mic OUT (GPIO 1)
-const int SPEAKER_PIN = 17;  // Crowtail Yellow Wire (GPIO 4)
-const int BUTTON_PIN = 0;   // BOOT Button (GPIO 0)
-const int LED_PIN = 10;
+// ---------------- PINS ----------------
+const int MIC_PIN    = 36;   // MAX9814 OUT
+const int LED_PIN    = 2;    // onboard LED
+const int BUTTON_PIN = 0;    // BOOT button
 
-// Communication with Arduino Uno (Pin 13 -> Uno Pin 2)
-#define ARDUINO_TX_PIN 13 
+// DAC pins -> PAM8403 inputs
+const int DAC_L = 25;        // PAM L-IN
 
-// Audio I2S Pins (Required by library)
-#define I2S_DOUT      SPEAKER_PIN
-#define I2S_BCLK      17    // Not connected, but required by config
-#define I2S_LRC       16    // Not connected, but required by config
-
-// --- SETTINGS ---
+// ---------------- AUDIO RECORD SETTINGS ----------------
 const int SAMPLE_RATE = 16000;
-const int RECORD_TIME_SECONDS = 3; 
-// Mic Calibration (1.25V Bias on 3.3V ADC approx 1550)
-int zeroLevel = 1550; 
+const int RECORD_TIME_SECONDS = 3;
+const int TOTAL_SAMPLES = SAMPLE_RATE * RECORD_TIME_SECONDS;
 
-Audio audio;
-int16_t *micBuffer = NULL;
-HardwareSerial ArduinoSerial(2); // UART2 for communicating with Arduino
+// Your “zeroLevel” baseline (works, but we also compute a quick baseline each record)
+int zeroLevel = 1800;
+int16_t *audioBuffer = nullptr;
+
+// Optional: prevent playing the same action twice in a row
+bool SUPPRESS_SAME_ACTION = false;
+String lastAction = "";
+
+// ---------- WAV helpers (SPIFFS player) ----------
+uint32_t rd32(File &f){
+  uint8_t b[4]; f.read(b,4);
+  return (uint32_t)b[0] | ((uint32_t)b[1]<<8) | ((uint32_t)b[2]<<16) | ((uint32_t)b[3]<<24);
+}
+uint16_t rd16(File &f){
+  uint8_t b[2]; f.read(b,2);
+  return (uint16_t)b[0] | ((uint16_t)b[1]<<8);
+}
+
+bool playWavFromSPIFFS(const char* path) {
+  File f = SPIFFS.open(path, "r");
+  if (!f) {
+    Serial.print("File not found: ");
+    Serial.println(path);
+    return false;
+  }
+
+  char riff[4]; f.readBytes(riff, 4);
+  if (memcmp(riff, "RIFF", 4) != 0) { Serial.println("Not RIFF"); f.close(); return false; }
+  rd32(f);
+  char wave[4]; f.readBytes(wave, 4);
+  if (memcmp(wave, "WAVE", 4) != 0) { Serial.println("Not WAVE"); f.close(); return false; }
+
+  uint16_t audioFormat=0, numCh=0, bits=0;
+  uint32_t sampleRate=0, dataSize=0;
+
+  while (f.available()) {
+    char id[4]; f.readBytes(id, 4);
+    uint32_t sz = rd32(f);
+
+    if (memcmp(id, "fmt ", 4) == 0) {
+      audioFormat = rd16(f);
+      numCh = rd16(f);
+      sampleRate = rd32(f);
+      rd32(f);   // byteRate
+      rd16(f);   // blockAlign
+      bits = rd16(f);
+      if (sz > 16) f.seek(f.position() + (sz - 16));
+    } else if (memcmp(id, "data", 4) == 0) {
+      dataSize = sz;
+      break;
+    } else {
+      f.seek(f.position() + sz);
+    }
+  }
+
+  Serial.printf("Playing %s | fmt=%u ch=%u sr=%lu bits=%u data=%lu\n",
+                path, audioFormat, numCh, (unsigned long)sampleRate, bits, (unsigned long)dataSize);
+
+  // Your player expects PCM, mono, 8-bit
+  if (audioFormat != 1 || numCh != 1 || bits != 8 || sampleRate == 0 || dataSize == 0) {
+    Serial.println("WAV must be PCM, mono, 8-bit.");
+    f.close();
+    return false;
+  }
+
+  const uint32_t usPerSample = 1000000UL / sampleRate;
+  uint8_t buf[512];
+  uint32_t played = 0;
+  uint32_t nextMicros = micros();
+
+  while (played < dataSize && f.available()) {
+    int toRead = (dataSize - played) > sizeof(buf) ? sizeof(buf) : (dataSize - played);
+    int n = f.read(buf, toRead);
+    if (n <= 0) break;
+
+    for (int i = 0; i < n; i++) {
+      while ((int32_t)(micros() - nextMicros) < 0) {}
+      nextMicros += usPerSample;
+
+      // buf[i] is 0..255 => perfect for dacWrite
+      dacWrite(DAC_L, buf[i]);
+    }
+    played += n;
+  }
+
+  f.close();
+  Serial.println("Done playing.");
+  return true;
+}
+
+// ---------- Networking ----------
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// Call /reset once at boot so server starts in known state and returns PLAY:WELCOME
+String callReset() {
+  if (WiFi.status() != WL_CONNECTED) return "";
+
+  HTTPClient http;
+  WiFiClient client;
+  http.begin(client, SERVER_RESET);
+  int code = http.GET();
+  String resp = (code > 0) ? http.getString() : "";
+  http.end();
+
+  Serial.print("RESET resp: ");
+  Serial.println(resp);
+  return resp;
+}
+
+// Upload raw PCM16 buffer to /upload
+String uploadAudio() {
+  if (WiFi.status() != WL_CONNECTED) return "";
+
+  HTTPClient http;
+  WiFiClient client;
+
+  http.begin(client, SERVER_UPLOAD);
+  http.setReuse(false);
+  http.addHeader("Content-Type", "application/octet-stream");
+
+  int bytesLen = TOTAL_SAMPLES * sizeof(int16_t);
+  int code = http.POST((uint8_t*)audioBuffer, bytesLen);
+
+  String resp = (code > 0) ? http.getString() : "";
+  Serial.print("UPLOAD HTTP code: ");
+  Serial.println(code);
+  Serial.print("UPLOAD resp: ");
+  Serial.println(resp);
+
+  http.end();
+  return resp;
+}
+
+// ---------- Parse server response ----------
+bool parseAction(const String& resp, String &heardOut, String &actionOut) {
+  // Expected: HEARD:<text>|PLAY:<ACTION>
+  int sep = resp.indexOf('|');
+  if (sep < 0) return false;
+
+  String left = resp.substring(0, sep);
+  String right = resp.substring(sep + 1);
+
+  if (left.startsWith("HEARD:")) heardOut = left.substring(6);
+  else heardOut = left;
+
+  actionOut = right;  // e.g. PLAY:WELCOME
+  actionOut.trim();
+  return true;
+}
+
+const char* actionToWav(const String& action) {
+  // action example: "PLAY:WELCOME"
+  if (action == "PLAY:WELCOME")       return "/welcome.wav";
+  if (action == "PLAY:SUGARQUESTION") return "/sugarquestion.wav";
+  if (action == "PLAY:STARTORDER")    return "/startorder.wav";
+  return nullptr;
+}
+
+// ---------- Recording ----------
+void recordAudio() {
+  // ADC setup (your working setup)
+  analogSetAttenuation(ADC_11db);
+  analogReadResolution(12);
+
+  // Quick baseline each time (more reliable than a fixed zeroLevel)
+  long sum = 0;
+  const int N = 200;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(MIC_PIN);
+    delay(2);
+  }
+  int baseline = sum / N;
+  zeroLevel = baseline; // keep it updated
+
+  Serial.print("Baseline: ");
+  Serial.println(zeroLevel);
+
+  digitalWrite(LED_PIN, HIGH);
+
+  unsigned long startTime = micros();
+  const int samplingInterval = 1000000 / SAMPLE_RATE;
+
+  for (int i = 0; i < TOTAL_SAMPLES; i++) {
+    unsigned long nextSampleTime = startTime + (i * samplingInterval);
+    while (micros() < nextSampleTime) {}
+
+    int raw = analogRead(MIC_PIN);
+    int shifted = raw - zeroLevel;
+
+    // Your gain
+    shifted *= 4;
+
+    // Clip
+    if (shifted > 32767) shifted = 32767;
+    if (shifted < -32768) shifted = -32768;
+
+    audioBuffer[i] = (int16_t)shifted;
+  }
+
+  digitalWrite(LED_PIN, LOW);
+}
+
+// ---------- Main flow ----------
+void handleServerResponse(const String& resp) {
+  
+  Serial.print("RAW SERVER DATA: "); // <--- ADD THIS
+  Serial.println(resp);
+
+  String heard, action;
+  if (!parseAction(resp, heard, action)) {
+    Serial.println("Bad response format (no '|').");
+    return;
+  }
+
+  Serial.print("Heard: ");
+  Serial.println(heard);
+  Serial.print("Action: ");
+  Serial.println(action);
+
+  if (SUPPRESS_SAME_ACTION && action == lastAction) {
+    Serial.println("Same action as last time -> suppressed.");
+    return;
+  }
+
+  const char* wavPath = actionToWav(action);
+  if (!wavPath) {
+    Serial.println("Unknown action, no WAV mapped.");
+    lastAction = action; // still update to avoid spam
+    return;
+  }
+
+  playWavFromSPIFFS(wavPath);
+  lastAction = action;
+}
 
 void setup() {
   Serial.begin(115200);
-  
-  // 1. Setup Arduino Communication
-  ArduinoSerial.begin(9600, SERIAL_8N1, 14, ARDUINO_TX_PIN); 
-
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  // 2. Setup Mic
-  // This is critical for ESP32 S3 ADC to work with the Mic
-  analogSetAttenuation(ADC_11db);
-
-  // 3. Setup WiFi
-  Serial.print("Connecting to WiFi");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500); Serial.print(".");
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-  }
-  Serial.println("\nWiFi Connected");
   digitalWrite(LED_PIN, LOW);
 
-  // 4. Setup Speaker
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  audio.setVolume(14);   // Lower volume = Less Static noise
-  audio.forceMono(true); // Combine channels for better clarity
+  // SPIFFS
+  if (!SPIFFS.begin(false)) {
+    Serial.println("SPIFFS mount failed");
+    while (1) delay(1000);
+  }
+  Serial.println("SPIFFS OK");
 
-  // 5. Allocate Memory
-  micBuffer = (int16_t*) malloc(SAMPLE_RATE * RECORD_TIME_SECONDS * sizeof(int16_t));
-  if(micBuffer == NULL) {
-    Serial.println("CRITICAL ERROR: Not enough RAM for audio buffer!");
-    while(1) delay(100);
+  // Allocate audio buffer
+  audioBuffer = (int16_t*) malloc(TOTAL_SAMPLES * sizeof(int16_t));
+  if (!audioBuffer) {
+    Serial.println("Out of memory for audioBuffer!");
+    while (1) delay(1000);
   }
 
-  // 6. Say Hello
-  getWelcomeMessage();
+  // WiFi
+  connectWiFi();
+
+  // Reset server session and play whatever it returns (usually welcome)
+  String resetResp = callReset();
+  if (resetResp.length()) {
+    handleServerResponse(resetResp);
+  }
+
+  Serial.println("--- READY: PRESS BOOT BUTTON TO RECORD ---");
 }
 
 void loop() {
-  // Keep the audio engine running
-  audio.loop();
-
-  // Check Button
+  // Button press
   if (digitalRead(BUTTON_PIN) == LOW) {
-    // Stop playing audio immediately if user wants to speak
-    if(audio.isRunning()) {
-      audio.stopSong();
-    }
-    
-    delay(50); // Debounce
+    delay(60); // debounce
     if (digitalRead(BUTTON_PIN) == LOW) {
-      Serial.println("Button Pressed -> Listening...");
-      recordAndSend();
+      Serial.println("Recording...");
+      recordAudio();
+
+      delay(200);
+
+      Serial.println("Uploading...");
+      String resp = uploadAudio();
+      if (resp.length()) handleServerResponse(resp);
+
+      Serial.println("--- READY ---");
+
+      // Wait for release so it doesn't trigger multiple times
+      while (digitalRead(BUTTON_PIN) == LOW) delay(10);
     }
   }
-}
 
-// --- NETWORK & AUDIO FUNCTIONS ---
-
-void handleServerResponse(String response) {
-  // Format 1: Command -> "CMD:tea:2:http://..."
-  // Format 2: Audio Only -> "http://..."
-  
-  if (response.startsWith("CMD:")) {
-    // It's a command!
-    int lastColon = response.lastIndexOf(':');
-    if (lastColon != -1) {
-      String commandPart = response.substring(4, lastColon); // "tea:2"
-      String audioURL = response.substring(lastColon + 1);   // "http://..."
-      
-      Serial.print("Sending Command to Arduino: "); Serial.println(commandPart);
-      ArduinoSerial.println(commandPart); 
-      
-      // Play the confirmation audio
-      audio.connecttohost(audioURL.c_str());
-    }
-  } else if (response.startsWith("http")) {
-    // Just a conversation reply
-    Serial.println("Playing Audio Response...");
-    audio.connecttohost(response.c_str());
-  }
-}
-
-void getWelcomeMessage() {
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClient client;
-    HTTPClient http;
-    String url = String(SERVER_BASE_URL) + "/reset"; 
-    
-    // Using correct syntax for modern ESP32 boards
-    http.begin(client, url);
-    int httpCode = http.GET();
-    
-    if (httpCode == 200) {
-      String response = http.getString();
-      handleServerResponse(response);
-    } else {
-      Serial.print("Welcome Error: "); Serial.println(httpCode);
-    }
-    http.end();
-  }
-}
-
-void recordAndSend() {
-  digitalWrite(LED_PIN, HIGH); // LED ON
-  
-  unsigned long startTime = micros();
-  const int interval = 1000000 / SAMPLE_RATE;
-  int totalSamples = SAMPLE_RATE * RECORD_TIME_SECONDS;
-  
-  // Record Loop
-  for (int i = 0; i < totalSamples; i++) {
-    unsigned long next = startTime + (i * interval);
-    while (micros() < next); // Wait for exact timing
-    
-    int raw = analogRead(MIC_PIN);
-    
-    // Process Audio (Center & Amplify)
-    int shifted = (raw - zeroLevel) * 4; 
-    if (shifted > 32767) shifted = 32767;
-    if (shifted < -32768) shifted = -32768;
-    
-    micBuffer[i] = (int16_t)shifted;
-  }
-  
-  digitalWrite(LED_PIN, LOW); // LED OFF
-  
-  // Upload Loop
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Uploading...");
-    WiFiClient client;
-    HTTPClient http;
-    String url = String(SERVER_BASE_URL) + "/upload";
-    
-    http.begin(client, url);
-    http.addHeader("Content-Type", "application/octet-stream");
-    
-    int httpCode = http.POST((uint8_t *)micBuffer, totalSamples * sizeof(int16_t));
-    
-    if (httpCode == 200) {
-      String response = http.getString();
-      Serial.println("Server: " + response);
-      handleServerResponse(response);
-    } else {
-      Serial.print("Upload Error: "); Serial.println(httpCode);
-    }
-    http.end();
-  }
+  delay(10);
 }
