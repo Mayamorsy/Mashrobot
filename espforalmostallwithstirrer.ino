@@ -8,6 +8,7 @@
 #define STIR_SERVO_PIN 21
 
 // ---------- STIR MOTOR ----------
+#define STIR_MOTOR_ENB 9
 #define STIR_MOTOR_IN3 1
 #define STIR_MOTOR_IN4 37
 
@@ -56,19 +57,26 @@ void runStirrer() {
   systemBusy = true;
   Serial2.println("BUSY");
 
-  stirServo.write(90); delay(1000);
+  stirServo.write(110);        // Move MG996R down
+  delay(1200); 
+
   digitalWrite(STIR_MOTOR_IN3, HIGH);
   digitalWrite(STIR_MOTOR_IN4, LOW);
-  delay(1000);
+  analogWrite(STIR_MOTOR_ENB, 75); // Lower speed (adjust 0-255)
+  
+  delay(2000);                 // Stir for 3 seconds
 
-  // Active braking
-  digitalWrite(STIR_MOTOR_IN3, HIGH);
+  digitalWrite(STIR_MOTOR_IN3, HIGH); // Active Brake
   digitalWrite(STIR_MOTOR_IN4, HIGH);
-  delay(100);
+  delay(300);
+  
+  analogWrite(STIR_MOTOR_ENB, 0);    // Power off
   digitalWrite(STIR_MOTOR_IN3, LOW);
   digitalWrite(STIR_MOTOR_IN4, LOW);
 
-  stirServo.write(0); delay(1000);
+  stirServo.write(0);          // Lift MG996R up
+  delay(1200); 
+
   Serial2.println("DONE");
   systemBusy = false;
 }
@@ -101,6 +109,8 @@ void setup() {
   pinMode(PUMP_ENA, OUTPUT);
   pinMode(PUMP_IN1, OUTPUT);
   pinMode(PUMP_IN2, OUTPUT);
+  pinMode(STIR_MOTOR_ENB, OUTPUT);
+  stirServo.write(0);
   pinMode(STIR_MOTOR_IN3, OUTPUT);
   pinMode(STIR_MOTOR_IN4, OUTPUT);
 
